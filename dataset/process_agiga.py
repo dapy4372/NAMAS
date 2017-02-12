@@ -16,6 +16,10 @@ import sys
 import os
 import re
 import gzip
+from bs4 import BeautifulSoup
+from nltk import Tree
+from collections import Counter
+from pdb import set_trace as bp
 #@lint-avoid-python-3-compatibility-imports
 
 # Make directory for output if it doesn't exist
@@ -31,10 +35,15 @@ end = "/".join(sys.argv[1].split("/")[-2:])[:-len(".xml.gz")] + ".txt"
 out = open(sys.argv[2] + end, "w")
 
 # Parse and print titles and articles
-NONE, HEAD, NEXT, TEXT = 0, 1, 2, 3
+NONE, HEAD, NEXT, TEXT, SENT = 0, 1, 2, 3, 4
 MODE = NONE
 title_parse = ""
+headline = ""
 article_parse = []
+words = []
+lemmas = []
+ners = []
+num_sent = 0
 
 # FIX: Some parses are mis-parenthesized.
 def fix_paren(parse):
@@ -56,35 +65,107 @@ def get_words(parse):
 def remove_digits(parse):
     return re.sub(r'\d', '#', parse)
 
-for l in gzip.open(sys.argv[1]):
-    if MODE == HEAD:
-        title_parse = remove_digits(fix_paren(l.strip()))
-        MODE = NEXT
+def add_ner_order(ners):
+    c = Counter()
+    prev_n = ""
+    for idx in range(len(ners)):
+        n = ners[idx][:4]
 
-    if MODE == TEXT:
-        article_parse.append(remove_digits(fix_paren(l.strip())))
+        if prev_n == n:
+            ners[idx] = "%s_%d" % (prev_n, c[prev_n])
+        else:
+            ners[idx] = "%s_%d" % (n, c[n])
+            c[prev_n] += 1
+        prev_n = n
+    return ners
 
-    if MODE == NONE and l.strip() == "<HEADLINE>":
-        MODE = HEAD
+def replace_headline(headline, words, ners):
+    ret_hl = []
+    for h in headline:
+        if h in words:
+            idx = words.index(h)
+            if ners[idx][:1] != "O":
+                ret_hl.append(ners[idx])
+                continue
+        ret_hl.append(h)
+    return ret_hl
 
-    if MODE == NEXT and l.strip() == "<P>":
-        MODE = TEXT
+def replace_lemma(lemmas, ners):
+    for idx in range(len(ners)):
+        if ners[idx][:1] != "O":
+            lemmas[idx] = ners[idx]
+    return lemmas
 
-    if MODE == TEXT and l.strip() == "</P>":
-        articles = []
-        # Annotated gigaword has a poor sentence segmenter.
-        # Ensure there is a least a period.
+tags = ['MISC', 'LOCA', 'PERS', 'DATA', 'ORGA', 'MONE', 'PERC', 'TIME']
 
-        for i in range(len(article_parse)):
-            articles.append(article_parse[i])
-            if "(. .)" in article_parse[i]:
-                break
+def trim(target):
+    prev_t = ""
+    ret = []
+    for t in target:
+        if t == prev_t and t[:4] in tags:
+            continue
+        else:
+            ret.append(t)
+        prev_t = t
+    return ret
 
-        article_parse = "(TOP " + " ".join(articles) + ")"
+with gzip.open(sys.argv[1]) as f:
+    while 1:
+        line = f.readline()
+        if not line:
+            break
+        line = line.strip()
 
-        # title_parse \t article_parse \t title \t article
-        print >>out, "\t".join([title_parse, article_parse,
-                                " ".join(get_words(title_parse)),
-                                " ".join(get_words(article_parse))])
-        article_parse = []
-        MODE = NONE
+        if MODE == HEAD:
+            hl = remove_digits(fix_paren(line))
+            headline = Tree.fromstring(hl).leaves()
+            MODE = NEXT
+
+        if MODE == TEXT:
+            article_parse.append(remove_digits(fix_paren(line)))
+
+        if MODE == SENT and re.match(r'<token id=\"[\d]+\">', line):
+            words.append(f.readline().strip().replace("<word>", "").replace("</word>", ""))
+            lemmas.append(f.readline().strip().replace("<lemma>", "").replace("</lemma>", ""))
+            for _ in range(3):
+                f.readline()
+            ners.append(f.readline().strip().replace("<NER>", "").replace("</NER>", ""))
+
+        if MODE == NONE and line == "<HEADLINE>":
+            MODE = HEAD
+
+        if MODE == NEXT and len(article_parse) == 0 and line == "<P>":
+            MODE = TEXT
+
+        if MODE == TEXT and line == "</P>":
+            MODE = NEXT
+            
+        #if re.match(r'<sentence id=\"\d\">', line):
+        #if re.match(r'<token id=\"\d\">', line):
+            #print("123")
+
+        if MODE == NEXT and re.match(r'<sentence id=\"[\d]+\">', line):
+            if len(article_parse) > num_sent:
+                MODE = SENT
+                num_sent += 1
+            else:
+                MODE = NEXT
+
+        if MODE == SENT and line == "</sentence>":
+            MODE = NEXT
+
+        if MODE == NEXT and len(article_parse) != 0 and len(article_parse) == num_sent:
+            assert(len(lemmas) == len(words))
+            assert(len(ners) == len(words))
+
+            ners = add_ner_order(ners)
+            title_parse = trim(replace_headline(headline, words, ners))
+            article_parse = trim(replace_lemma(lemmas, ners))
+            print >>out, "\t".join([" ".join(title_parse), " ".join(article_parse)])
+            
+            words = []
+            lemmas = []
+            ners = []
+            article_parse = []
+            num_sent = 0
+            MODE = NONE
